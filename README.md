@@ -1,19 +1,20 @@
 # Autoregressive Flow Matching for Gas Sensors
 
-This project contains an autoregressive conditional flow-matching model for generating 12-sensor concentration trajectories over time.
+This project contains an autoregressive conditional flow-matching model for generating full 3D concentration trajectories over time.
 
 ## Project structure
 
 - `main.py`: main CLI entrypoint with `train` and `generate` commands.
-- `fm_gas/data_utils.py`: trajectory loading and normalization utilities.
-- `fm_gas/features.py`: sensor position utilities.
+- `fm_gas/data_utils.py`: trajectory + conditioning loading utilities.
 - `fm_gas/model.py`: spatially-aware vector field model and Euler sampler.
 - `fm_gas/train.py`: training loop.
-- `fm_gas/generate.py`: autoregressive generation/export logic.
+- `fm_gas/generate.py`: full-field generation/export logic.
 
 ## Data used
 
-- Sensor trajectories:
+- Binned trajectories (target):
+  - `data/*_binned.csv` (columns `x_m,y_m,z_m,c_{time}`)
+- Surface averages (conditioning):
   - `data/*_surface_averages.csv`
 - Sensor positions:
   - `data/sensor_coords.csv` (columns `sensor,x,y,z` for 12 sensors)
@@ -50,21 +51,22 @@ cd /home/wjq8vw/projects/gas_flow_matching
   --checkpoint checkpoints/flow_matcher.pt \
   --sensor-coords-csv data/sensor_coords.csv \
   --inlet-outlet-coords-csv data/inlet_outlet_coords.csv \
-  --init-surface-csv data/Gas_3D_sim08_19_09_50sccm_surface_averages.csv \
-  --trajectory-length 100 \
+  --binned-csv data/Gas_3D_sim08_19_09_50sccm_binned.csv \
+  --surface-avg-csv data/Gas_3D_sim08_19_09_50sccm_surface_averages.csv \
   --num-steps 50 \
   --output-csv outputs/generated_surface_trajectory.csv
 ```
 
 The output CSV format is:
-- First column: `Time`
-- Remaining columns: `Concentration_1` ... `Concentration_12`
+- First three columns: `x_m`, `y_m`, `z_m`
+- Remaining columns: `c_{time}` trajectory values
 
 ## Model summary
 
 - Training objective: autoregressive conditional flow matching
-- State variable: 12-sensor concentration vector per timestep
+- State variable: full field concentration vector per timestep
 - Conditioning:
-  - history window of size `k`
-  - sensor positions used for spatial attention bias
+  - surface averages history window of size `k`
+  - full surface averages time series
   - inlet/outlet coordinates and sccm parsed from each trajectory filename
+  - sensor positions as part of the global condition

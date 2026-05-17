@@ -75,18 +75,18 @@ class SpatialTransformerBlock(nn.Module):
 class AutoregressiveFlowMatcher(nn.Module):
     def __init__(
         self,
-        sensor_positions: torch.Tensor,
-        global_cond_dim: int = 7,
+        point_positions: torch.Tensor,
+        global_cond_dim: int,
         history_k: int = 1,
         hidden_dim: int = 128,
         num_layers: int = 4,
         num_heads: int = 4,
     ):
         super().__init__()
-        if sensor_positions.ndim != 2 or sensor_positions.shape[1] != 3:
-            raise ValueError("sensor_positions must have shape [num_nodes, 3].")
+        if point_positions.ndim != 2 or point_positions.shape[1] != 3:
+            raise ValueError("point_positions must have shape [num_points, 3].")
         self.history_k = int(history_k)
-        self.num_nodes = int(sensor_positions.shape[0])
+        self.num_nodes = int(point_positions.shape[0])
         self.global_cond_dim = int(global_cond_dim)
         self.hidden_dim = int(hidden_dim)
         self.num_layers = int(num_layers)
@@ -97,12 +97,12 @@ class AutoregressiveFlowMatcher(nn.Module):
         self.input_proj = nn.Sequential(nn.Linear(self.history_k + 1, hidden_dim), nn.SiLU())
         self.global_proj = nn.Sequential(nn.Linear(self.global_cond_dim, hidden_dim), nn.SiLU())
 
-        self.register_buffer("sensor_positions", sensor_positions, persistent=False)
+        self.register_buffer("point_positions", point_positions, persistent=False)
         self.pos_mlp = nn.Sequential(nn.Linear(3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
         self.dist_mlp = nn.Sequential(nn.Linear(1, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, num_heads))
         self.register_buffer(
             "pairwise_dist",
-            torch.cdist(sensor_positions, sensor_positions).unsqueeze(-1),
+            torch.cdist(point_positions, point_positions).unsqueeze(-1),
             persistent=False,
         )
 
@@ -110,15 +110,21 @@ class AutoregressiveFlowMatcher(nn.Module):
         self.out_norm = nn.LayerNorm(hidden_dim)
         self.out_proj = nn.Linear(hidden_dim, 1)
 
-    def forward(self, x_t: torch.Tensor, t: torch.Tensor, history: torch.Tensor, global_cond: torch.Tensor) -> torch.Tensor:
-        if history.shape[1] != self.history_k:
-            raise ValueError("history has wrong length for history_k.")
-        history_flat = history.squeeze(-1).transpose(1, 2)
+    def forward(
+        self,
+        x_t: torch.Tensor,
+        t: torch.Tensor,
+        field_history: torch.Tensor,
+        global_cond: torch.Tensor,
+    ) -> torch.Tensor:
+        if field_history.shape[1] != self.history_k:
+            raise ValueError("field_history has wrong length for history_k.")
         xt_flat = x_t.squeeze(-1)
-        features = torch.cat([xt_flat.unsqueeze(-1), history_flat], dim=-1)
+        field_hist_flat = field_history.transpose(1, 2)
+        features = torch.cat([xt_flat.unsqueeze(-1), field_hist_flat], dim=-1)
         hidden = self.input_proj(features)
 
-        pos_emb = self.pos_mlp(self.sensor_positions).unsqueeze(0)
+        pos_emb = self.pos_mlp(self.point_positions).unsqueeze(0)
         dist_bias = self.dist_mlp(self.pairwise_dist).permute(2, 0, 1).unsqueeze(0)
         t_embed = self.time_proj(self.time_emb(t)).unsqueeze(1)
         global_embed = self.global_proj(global_cond).unsqueeze(1)
@@ -128,9 +134,37 @@ class AutoregressiveFlowMatcher(nn.Module):
         return self.out_proj(self.out_norm(hidden))
 
 
+class PrefixInitializer(nn.Module):
+    def __init__(
+        self,
+        point_positions: torch.Tensor,
+        global_cond_dim: int,
+        history_k: int,
+        hidden_dim: int = 128,
+    ):
+        super().__init__()
+        if point_positions.ndim != 2 or point_positions.shape[1] != 3:
+            raise ValueError("point_positions must have shape [num_points, 3].")
+        self.history_k = int(history_k)
+        self.hidden_dim = int(hidden_dim)
+        self.global_cond_dim = int(global_cond_dim)
+
+        self.register_buffer("point_positions", point_positions, persistent=False)
+        self.pos_mlp = nn.Sequential(nn.Linear(3, hidden_dim), nn.SiLU(), nn.Linear(hidden_dim, hidden_dim))
+        self.global_proj = nn.Sequential(nn.Linear(self.global_cond_dim, hidden_dim), nn.SiLU())
+        self.out_proj = nn.Sequential(nn.LayerNorm(hidden_dim), nn.Linear(hidden_dim, self.history_k))
+
+    def forward(self, global_cond: torch.Tensor) -> torch.Tensor:
+        pos_emb = self.pos_mlp(self.point_positions).unsqueeze(0)
+        global_embed = self.global_proj(global_cond).unsqueeze(1)
+        hidden = pos_emb + global_embed
+        out = self.out_proj(hidden)
+        return out.permute(0, 2, 1).unsqueeze(-1)
+
+
 def flow_matching_loss(
     model: AutoregressiveFlowMatcher,
-    history: torch.Tensor,
+    field_history: torch.Tensor,
     target_next: torch.Tensor,
     global_cond: torch.Tensor,
 ) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -140,7 +174,7 @@ def flow_matching_loss(
     t = torch.rand(batch_size, device=device)
     x_t = (1.0 - t[:, None, None]) * x0 + t[:, None, None] * target_next
     target_v = target_next - x0
-    pred_v = model(x_t, t, history, global_cond)
+    pred_v = model(x_t, t, field_history, global_cond)
     loss = torch.mean((pred_v - target_v) ** 2)
     return loss, x_t, pred_v
 
@@ -148,15 +182,16 @@ def flow_matching_loss(
 @torch.no_grad()
 def euler_sample(
     model: AutoregressiveFlowMatcher,
-    history: torch.Tensor,
+    field_history: torch.Tensor,
     global_cond: torch.Tensor,
     num_steps: int,
 ) -> torch.Tensor:
-    device = history.device
-    batch_size, _, num_nodes, _ = history.shape
+    device = field_history.device
+    batch_size = field_history.shape[0]
+    num_nodes = model.num_nodes
     x = torch.randn(batch_size, num_nodes, 1, device=device)
     dt = 1.0 / float(num_steps)
     for i in range(num_steps):
         t = torch.full((batch_size,), fill_value=i / num_steps, device=device)
-        x = x + dt * model(x, t, history, global_cond)
+        x = x + dt * model(x, t, field_history, global_cond)
     return x

@@ -35,7 +35,11 @@ python main.py train \
     --epochs 3 \
     --batch-size 256 \
     --lr 2e-4 \
-    --hidden-dim 128
+    --hidden-dim 128 \
+    --num-layers 4 \
+    --prefix-loss-weight 1.0 \
+    --save-every 10 \
+    --checkpoint "checkpoints/flow_matcher.pt"
 
 echo "Job finished successfully."
 
@@ -48,7 +52,8 @@ echo "Job finished successfully."
 #     --checkpoint "checkpoints/flow_matcher.pt" \
 #     --sensor-coords-csv data/sensor_coords.csv \
 #     --inlet-outlet-coords-csv data/inlet_outlet_coords.csv \
-#     --init-surface-csv data/Gas_3D_sim08_19_09_50sccm_surface_averages.csv \
-#     --trajectory-length 100 \
+#     --binned-csv data/Gas_3D_sim08_19_09_50sccm_binned.csv \
+#     --surface-avg-csv data/Gas_3D_sim08_19_09_50sccm_surface_averages.csv \
+#     --cold-start \
 #     --num-steps 50 \
 #     --output-csv "outputs/generated_surface_trajectory.csv"
