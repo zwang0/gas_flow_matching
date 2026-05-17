@@ -5,157 +5,129 @@ import torch
 from torch.utils.data import DataLoader, random_split
 from tqdm import tqdm
 
-from .data_utils import prepare_data
-from .features import (
-    build_global_condition,
-    build_sensor_condition_matrix,
-    make_condition_matrix,
-    normalize_features,
-)
-from .model import ConditionalFlowMatcher, TrajectoryDataset
+from .data_utils import HistoryWindowDataset, load_trajectory_tensor, normalize_trajectories
+from .features import default_sensor_positions_path, load_sensor_positions
+from .model import AutoregressiveFlowMatcher, flow_matching_loss
 
 
 def train(args) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    constraint_mode = str(args.constraint_mode).lower()
 
-    prepared = prepare_data(
-        traj_csv=args.traj_csv,
-        sensor_csv=args.sensor_csv,
-        sensor_coords_csv=args.sensor_coords_csv,
+    max_traj = None if int(args.max_traj) <= 0 else int(args.max_traj)
+    batch = load_trajectory_tensor(
+        args.data_dir,
         inlet_outlet_coords_csv=args.inlet_outlet_coords_csv,
-        inlet_id=args.inlet_id,
-        outlet_id=args.outlet_id,
-        flow_sccm=args.flow_sccm,
-        sensor_map_k=args.sensor_map_k,
+        max_files=max_traj,
     )
+    trajectories, traj_mean, traj_std = normalize_trajectories(batch.trajectories)
 
-    traj_norm, traj_mean, traj_std = normalize_features(prepared.trajectories)
-    pos_norm, pos_mean, pos_std = normalize_features(prepared.positions)
-    global_cond = build_global_condition(prepared)
-    cond_matrix = make_condition_matrix(pos_norm, global_cond)
+    cond_mean = batch.global_cond.mean(axis=0, keepdims=True)
+    cond_std = batch.global_cond.std(axis=0, keepdims=True)
+    cond_std = np.maximum(cond_std, 1e-6)
+    global_cond_norm = (batch.global_cond - cond_mean) / cond_std
 
-    sensor_targets = prepared.sensor_series.T.astype(np.float32)
-    sensor_targets_norm = ((sensor_targets - traj_mean) / traj_std).astype(np.float32)
-    sensor_cond_matrix = build_sensor_condition_matrix(
-        cond_matrix=cond_matrix,
-        sensor_indices=prepared.sensor_mapping.indices,
-        sensor_weights=prepared.sensor_mapping.weights,
+    dataset = HistoryWindowDataset(
+        torch.from_numpy(trajectories),
+        torch.from_numpy(global_cond_norm.astype(np.float32)),
+        history_k=args.history_k,
     )
-
-    sensor_targets_t = torch.from_numpy(sensor_targets_norm).to(device)
-    sensor_cond_t = torch.from_numpy(sensor_cond_matrix).to(device)
-
-    dataset = TrajectoryDataset(torch.from_numpy(traj_norm), torch.from_numpy(cond_matrix))
-    val_size = max(1, int(0.1 * len(dataset)))
-    train_size = len(dataset) - val_size
+    val_size = max(1, int(len(dataset) * args.val_fraction))
+    train_size = max(1, len(dataset) - val_size)
     train_set, val_set = random_split(dataset, [train_size, val_size])
 
     train_loader = DataLoader(train_set, batch_size=args.batch_size, shuffle=True, drop_last=False)
     val_loader = DataLoader(val_set, batch_size=args.batch_size, shuffle=False, drop_last=False)
 
-    model = ConditionalFlowMatcher(
-        traj_dim=traj_norm.shape[1],
-        cond_dim=cond_matrix.shape[1],
+    if args.sensor_coords_csv:
+        sensor_positions = load_sensor_positions(args.sensor_coords_csv)
+    else:
+        sensor_positions = load_sensor_positions(default_sensor_positions_path(args.data_dir))
+    sensor_positions_t = torch.from_numpy(sensor_positions).to(device)
+    model = AutoregressiveFlowMatcher(
+        sensor_positions=sensor_positions_t,
+        global_cond_dim=global_cond_norm.shape[1],
+        history_k=args.history_k,
         hidden_dim=args.hidden_dim,
+        num_layers=args.num_layers,
+        num_heads=args.num_heads,
     ).to(device)
 
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=1e-4)
     best_val = float("inf")
+    save_every = int(args.save_every) if hasattr(args, "save_every") else 0
     os.makedirs(os.path.dirname(args.checkpoint) or ".", exist_ok=True)
+    ckpt_root, ckpt_ext = os.path.splitext(args.checkpoint)
+    if not ckpt_ext:
+        ckpt_ext = ".pt"
 
     for epoch in range(1, args.epochs + 1):
-        if args.lambda_sensor_warmup_epochs > 0:
-            warmup = min(1.0, float(epoch) / float(args.lambda_sensor_warmup_epochs))
-        else:
-            warmup = 1.0
-        lambda_eff = float(args.lambda_sensor) * warmup
-
         model.train()
-        train_fm_losses = []
-        train_sensor_losses = []
-        for x1, cond in tqdm(train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False):
-            x1 = x1.to(device)
-            cond = cond.to(device)
-
-            x0 = torch.randn_like(x1)
-            t = torch.rand(x1.shape[0], device=device)
-            x_t = (1.0 - t[:, None]) * x0 + t[:, None] * x1
-            target_v = x1 - x0
-
-            fm_loss = torch.mean((model(x_t, t, cond) - target_v) ** 2)
-
-            sensor_loss = torch.tensor(0.0, device=device)
-            if constraint_mode in {"soft", "hybrid"}:
-                x0_s = torch.randn_like(sensor_targets_t)
-                t_s = torch.rand(sensor_targets_t.shape[0], device=device)
-                x_t_s = (1.0 - t_s[:, None]) * x0_s + t_s[:, None] * sensor_targets_t
-                pred_v_s = model(x_t_s, t_s, sensor_cond_t)
-                # Recover endpoint estimate x1 from linear bridge relation.
-                x1_hat_s = x_t_s + (1.0 - t_s[:, None]) * pred_v_s
-                sensor_loss = torch.mean((x1_hat_s - sensor_targets_t) ** 2)
-
-            loss = fm_loss + (lambda_eff * sensor_loss)
+        train_losses = []
+        for history, target, global_cond in tqdm(
+            train_loader, desc=f"Epoch {epoch}/{args.epochs} [train]", leave=False
+        ):
+            history = history.to(device)
+            target = target.to(device)
+            global_cond = global_cond.to(device)
+            loss, _, _ = flow_matching_loss(model, history, target, global_cond)
             optimizer.zero_grad()
             loss.backward()
             optimizer.step()
-            train_fm_losses.append(fm_loss.item())
-            train_sensor_losses.append(sensor_loss.item())
+            train_losses.append(loss.item())
 
         model.eval()
-        val_fm_losses = []
-        val_sensor_losses = []
+        val_losses = []
         with torch.no_grad():
-            for x1, cond in val_loader:
-                x1 = x1.to(device)
-                cond = cond.to(device)
-                x0 = torch.randn_like(x1)
-                t = torch.rand(x1.shape[0], device=device)
-                x_t = (1.0 - t[:, None]) * x0 + t[:, None] * x1
-                target_v = x1 - x0
-                fm_loss = torch.mean((model(x_t, t, cond) - target_v) ** 2)
+            for history, target, global_cond in val_loader:
+                history = history.to(device)
+                target = target.to(device)
+                global_cond = global_cond.to(device)
+                loss, _, _ = flow_matching_loss(model, history, target, global_cond)
+                val_losses.append(loss.item())
 
-                sensor_loss = torch.tensor(0.0, device=device)
-                if constraint_mode in {"soft", "hybrid"}:
-                    x0_s = torch.randn_like(sensor_targets_t)
-                    t_s = torch.rand(sensor_targets_t.shape[0], device=device)
-                    x_t_s = (1.0 - t_s[:, None]) * x0_s + t_s[:, None] * sensor_targets_t
-                    pred_v_s = model(x_t_s, t_s, sensor_cond_t)
-                    x1_hat_s = x_t_s + (1.0 - t_s[:, None]) * pred_v_s
-                    sensor_loss = torch.mean((x1_hat_s - sensor_targets_t) ** 2)
+        train_loss = float(np.mean(train_losses)) if train_losses else float("nan")
+        val_loss = float(np.mean(val_losses)) if val_losses else float("nan")
+        print(f"Epoch {epoch:04d} | train_loss={train_loss:.6f} | val_loss={val_loss:.6f}")
 
-                val_fm_losses.append(fm_loss.item())
-                val_sensor_losses.append(sensor_loss.item())
-
-        train_fm = float(np.mean(train_fm_losses)) if train_fm_losses else float("nan")
-        train_sensor = float(np.mean(train_sensor_losses)) if train_sensor_losses else float("nan")
-        val_fm = float(np.mean(val_fm_losses)) if val_fm_losses else float("nan")
-        val_sensor = float(np.mean(val_sensor_losses)) if val_sensor_losses else float("nan")
-
-        train_loss = train_fm + (lambda_eff * train_sensor)
-        val_loss = val_fm + (lambda_eff * val_sensor)
-        print(
-            f"Epoch {epoch:04d} | train_fm={train_fm:.6f} | train_sensor={train_sensor:.6f} "
-            f"| val_fm={val_fm:.6f} | val_sensor={val_sensor:.6f} | lambda_sensor={lambda_eff:.4f}"
-        )
+        if save_every > 0 and (epoch % save_every == 0):
+            epoch_path = f"{ckpt_root}_epoch{epoch:04d}{ckpt_ext}"
+            torch.save(
+                {
+                    "model_state_dict": model.state_dict(),
+                    "history_k": int(args.history_k),
+                    "num_nodes": int(batch.trajectories.shape[2]),
+                    "hidden_dim": int(args.hidden_dim),
+                    "num_layers": int(args.num_layers),
+                    "num_heads": int(args.num_heads),
+                    "traj_mean": traj_mean,
+                    "traj_std": traj_std,
+                    "time_values": batch.time_values,
+                    "sensor_names": batch.sensor_names,
+                    "sensor_positions": sensor_positions.astype(np.float32),
+                    "global_cond_mean": cond_mean.astype(np.float32),
+                    "global_cond_std": cond_std.astype(np.float32),
+                },
+                epoch_path,
+            )
+            print(f"Saved checkpoint to {epoch_path}")
 
         if val_loss < best_val:
             best_val = val_loss
             torch.save(
                 {
                     "model_state_dict": model.state_dict(),
-                    "traj_dim": traj_norm.shape[1],
-                    "cond_dim": cond_matrix.shape[1],
-                    "hidden_dim": args.hidden_dim,
-                    "time_columns": prepared.time_columns,
+                    "history_k": int(args.history_k),
+                    "num_nodes": int(batch.trajectories.shape[2]),
+                    "hidden_dim": int(args.hidden_dim),
+                    "num_layers": int(args.num_layers),
+                    "num_heads": int(args.num_heads),
                     "traj_mean": traj_mean,
                     "traj_std": traj_std,
-                    "pos_mean": pos_mean,
-                    "pos_std": pos_std,
-                    "constraint_mode": constraint_mode,
-                    "lambda_sensor": float(args.lambda_sensor),
-                    "lambda_sensor_warmup_epochs": int(args.lambda_sensor_warmup_epochs),
-                    "sensor_map_k": int(args.sensor_map_k),
+                    "time_values": batch.time_values,
+                    "sensor_names": batch.sensor_names,
+                    "sensor_positions": sensor_positions.astype(np.float32),
+                    "global_cond_mean": cond_mean.astype(np.float32),
+                    "global_cond_std": cond_std.astype(np.float32),
                 },
                 args.checkpoint,
             )

@@ -28,10 +28,14 @@ conda activate PDM
 echo "Starting training job..."
 
 python main.py train \
+    --data-dir data \
+    --sensor-coords-csv data/sensor_coords.csv \
+    --inlet-outlet-coords-csv data/inlet_outlet_coords.csv \
+    --history-k 1 \
     --epochs 3 \
     --batch-size 256 \
     --lr 2e-4 \
-    --hidden-dim 512
+    --hidden-dim 128
 
 echo "Job finished successfully."
 
@@ -41,6 +45,10 @@ echo "Job finished successfully."
 # ------------------------------------------------------------------------------
 # echo "Starting generation job..."
 # python main.py generate \
-#     --checkpoint "checkpoints/flow_matcher_09_18_09_50sccm.pt" \
-#     --num-steps 200 \
-#     --output-csv "outputs/generated_trajectories.csv"
+#     --checkpoint "checkpoints/flow_matcher.pt" \
+#     --sensor-coords-csv data/sensor_coords.csv \
+#     --inlet-outlet-coords-csv data/inlet_outlet_coords.csv \
+#     --init-surface-csv data/Gas_3D_sim08_19_09_50sccm_surface_averages.csv \
+#     --trajectory-length 100 \
+#     --num-steps 50 \
+#     --output-csv "outputs/generated_surface_trajectory.csv"

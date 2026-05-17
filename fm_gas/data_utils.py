@@ -1,167 +1,175 @@
+import os
+import re
 from dataclasses import dataclass
 from typing import List, Tuple
 
 import numpy as np
 import pandas as pd
+import torch
+from torch.utils.data import Dataset
 
 
 @dataclass
-class SensorPointMapping:
-    indices: np.ndarray
-    weights: np.ndarray
-    distances: np.ndarray
-
-
-@dataclass
-class PreparedData:
-    positions: np.ndarray
+class TrajectoryBatch:
     trajectories: np.ndarray
     time_values: np.ndarray
-    time_columns: List[str]
-    sensor_series: np.ndarray
-    sensor_coords: np.ndarray
-    sensor_mapping: SensorPointMapping
-    inlet_xyz: np.ndarray
-    outlet_xyz: np.ndarray
-    flow_sccm: float
+    sensor_names: List[str]
+    global_cond: np.ndarray
+    inlet_ids: np.ndarray
+    outlet_ids: np.ndarray
+    sccm_values: np.ndarray
 
 
-def ensure_columns(df: pd.DataFrame, columns: List[str], file_path: str) -> None:
-    missing = [c for c in columns if c not in df.columns]
-    if missing:
-        raise ValueError(f"Missing columns in {file_path}: {missing}")
+def _load_surface_averages(path: str) -> Tuple[np.ndarray, np.ndarray, List[str]]:
+    df = pd.read_csv(path)
+    if df.shape[1] < 2:
+        raise ValueError(f"Surface averages file {path} must include time and sensor columns.")
+    time_col = df.columns[0]
+    sensor_cols = list(df.columns[1:])
+    time_values = df[time_col].to_numpy(dtype=np.float32)
+    series = df[sensor_cols].to_numpy(dtype=np.float32)
+    return time_values, series, sensor_cols
 
 
-def load_inlet_outlet_xyz(coords_csv: str, inlet_id: int, outlet_id: int) -> Tuple[np.ndarray, np.ndarray]:
-    df = pd.read_csv(coords_csv)
-    ensure_columns(df, ["inlet_outlet", "x", "y", "z"], coords_csv)
-    df["inlet_outlet"] = df["inlet_outlet"].astype(int)
-
-    inlet_row = df[df["inlet_outlet"] == int(inlet_id)]
-    outlet_row = df[df["inlet_outlet"] == int(outlet_id)]
-    if inlet_row.empty:
-        raise ValueError(f"Inlet id {inlet_id} not found in {coords_csv}")
-    if outlet_row.empty:
-        raise ValueError(f"Outlet id {outlet_id} not found in {coords_csv}")
-
-    inlet_xyz = inlet_row[["x", "y", "z"]].iloc[0].to_numpy(dtype=np.float32)
-    outlet_xyz = outlet_row[["x", "y", "z"]].iloc[0].to_numpy(dtype=np.float32)
-    return inlet_xyz, outlet_xyz
-
-
-def load_sensor_coords(sensor_coords_csv: str) -> np.ndarray:
-    df = pd.read_csv(sensor_coords_csv)
-    ensure_columns(df, ["sensor", "x", "y", "z"], sensor_coords_csv)
-    df = df.sort_values("sensor")
-    return df[["x", "y", "z"]].to_numpy(dtype=np.float32)
-
-
-def parse_time_columns(columns: List[str]) -> Tuple[List[str], np.ndarray]:
-    time_columns = [c for c in columns if c.startswith("c_")]
-    if not time_columns:
-        raise ValueError("No concentration columns found with prefix 'c_'.")
-    times = np.array([float(c.split("_", 1)[1]) for c in time_columns], dtype=np.float32)
-    return time_columns, times
-
-
-def align_sensor_series(sensor_csv: str, target_times: np.ndarray) -> np.ndarray:
-    sensor_df = pd.read_csv(sensor_csv)
-    if sensor_df.shape[1] < 2:
-        raise ValueError(f"Sensor file {sensor_csv} must contain time and sensor columns.")
-
-    time_col = sensor_df.columns[0]
-    sensor_cols = list(sensor_df.columns[1:])
-
-    sensor_times = sensor_df[time_col].to_numpy(dtype=np.float32)
-    sensor_matrix = sensor_df[sensor_cols].to_numpy(dtype=np.float32)
-
-    sort_idx = np.argsort(sensor_times)
-    sensor_times = sensor_times[sort_idx]
-    sensor_matrix = sensor_matrix[sort_idx]
-
-    aligned = np.zeros((len(target_times), sensor_matrix.shape[1]), dtype=np.float32)
-    for i in range(sensor_matrix.shape[1]):
-        aligned[:, i] = np.interp(target_times, sensor_times, sensor_matrix[:, i])
-    return aligned
-
-
-def build_sensor_point_mapping(positions: np.ndarray, sensor_coords: np.ndarray, k: int = 1) -> SensorPointMapping:
-    if positions.ndim != 2 or positions.shape[1] != 3:
-        raise ValueError("positions must have shape [num_points, 3].")
-    if sensor_coords.ndim != 2 or sensor_coords.shape[1] != 3:
-        raise ValueError("sensor_coords must have shape [num_sensors, 3].")
-    if positions.shape[0] == 0:
-        raise ValueError("positions is empty; cannot map sensors.")
-
-    k = max(1, min(int(k), positions.shape[0]))
-
-    # Distance matrix: [num_sensors, num_points]
-    deltas = sensor_coords[:, None, :] - positions[None, :, :]
-    distances = np.linalg.norm(deltas, axis=2)
-
-    topk_idx = np.argpartition(distances, kth=k - 1, axis=1)[:, :k]
-    topk_dist = np.take_along_axis(distances, topk_idx, axis=1)
-
-    order = np.argsort(topk_dist, axis=1)
-    topk_idx = np.take_along_axis(topk_idx, order, axis=1)
-    topk_dist = np.take_along_axis(topk_dist, order, axis=1)
-
-    if k == 1:
-        weights = np.ones_like(topk_dist, dtype=np.float32)
-    else:
-        inv = 1.0 / np.maximum(topk_dist, 1e-6)
-        weights = inv / np.sum(inv, axis=1, keepdims=True)
-
-    if not np.all(np.isfinite(topk_dist)):
-        raise ValueError("Non-finite sensor mapping distances detected.")
-    if not np.all(np.isfinite(weights)):
-        raise ValueError("Non-finite sensor mapping weights detected.")
-
-    return SensorPointMapping(
-        indices=topk_idx.astype(np.int64),
-        weights=weights.astype(np.float32),
-        distances=topk_dist.astype(np.float32),
-    )
-
-
-def prepare_data(
-    traj_csv: str,
-    sensor_csv: str,
-    sensor_coords_csv: str,
-    inlet_outlet_coords_csv: str,
-    inlet_id: int,
-    outlet_id: int,
-    flow_sccm: float,
-    sensor_map_k: int = 1,
-) -> PreparedData:
-    traj_df = pd.read_csv(traj_csv)
-    ensure_columns(traj_df, ["x_m", "y_m", "z_m"], traj_csv)
-
-    time_columns, times = parse_time_columns(list(traj_df.columns))
-    positions = traj_df[["x_m", "y_m", "z_m"]].to_numpy(dtype=np.float32)
-    trajectories = traj_df[time_columns].to_numpy(dtype=np.float32)
-
-    sensor_series = align_sensor_series(sensor_csv, times)
-    sensor_coords = load_sensor_coords(sensor_coords_csv)
-
-    if sensor_series.shape[1] != sensor_coords.shape[0]:
+def _parse_metadata_from_name(file_name: str) -> Tuple[int, int, float]:
+    match = re.search(r"Gas_3D_sim\d+_(\d+)_(\d+)_([\d.]+)sccm", file_name)
+    if not match:
         raise ValueError(
-            "Number of sensor series columns does not match number of sensor coordinates. "
-            f"Series sensors={sensor_series.shape[1]}, coords sensors={sensor_coords.shape[0]}."
+            "Unable to parse inlet/outlet/sccm from filename. "
+            f"Expected pattern Gas_3D_sim{{id}}_{{inlet}}_{{outlet}}_{{sccm}}sccm, got {file_name}."
+        )
+    inlet_id = int(match.group(1))
+    outlet_id = int(match.group(2))
+    sccm = float(match.group(3))
+    return inlet_id, outlet_id, sccm
+
+
+def _load_inlet_outlet_coords(coords_csv: str) -> dict[int, np.ndarray]:
+    df = pd.read_csv(coords_csv)
+    if not {"inlet_outlet", "x", "y", "z"}.issubset(set(df.columns)):
+        raise ValueError(f"{coords_csv} must include columns inlet_outlet,x,y,z.")
+    df["inlet_outlet"] = df["inlet_outlet"].astype(int)
+    coords = {}
+    for _, row in df.iterrows():
+        coords[int(row["inlet_outlet"])] = np.array([row["x"], row["y"], row["z"]], dtype=np.float32)
+    return coords
+
+
+def build_global_cond_from_filename(file_path: str, inlet_outlet_coords_csv: str) -> np.ndarray:
+    inlet_id, outlet_id, sccm = _parse_metadata_from_name(os.path.basename(file_path))
+    coords_map = _load_inlet_outlet_coords(inlet_outlet_coords_csv)
+    if inlet_id not in coords_map or outlet_id not in coords_map:
+        raise ValueError(
+            "Inlet or outlet id not found in inlet_outlet_coords.csv. "
+            f"Got inlet={inlet_id}, outlet={outlet_id} from {file_path}."
+        )
+    inlet_xyz = coords_map[inlet_id]
+    outlet_xyz = coords_map[outlet_id]
+    return np.concatenate([inlet_xyz, outlet_xyz, np.array([sccm], dtype=np.float32)], axis=0)
+
+
+def load_trajectory_tensor(
+    data_dir: str,
+    inlet_outlet_coords_csv: str,
+    max_files: int | None = None,
+) -> TrajectoryBatch:
+    files = sorted(
+        f
+        for f in (os.path.join(data_dir, name) for name in os.listdir(data_dir))
+        if f.endswith("_surface_averages.csv")
+    )
+    if not files:
+        raise FileNotFoundError(
+            f"No *_surface_averages.csv files found in {data_dir}. "
+            "Use --data-dir to point at the folder with surface averages files."
         )
 
-    inlet_xyz, outlet_xyz = load_inlet_outlet_xyz(inlet_outlet_coords_csv, inlet_id, outlet_id)
-    sensor_mapping = build_sensor_point_mapping(positions=positions, sensor_coords=sensor_coords, k=sensor_map_k)
+    if max_files is not None:
+        files = files[: max(1, int(max_files))]
 
-    return PreparedData(
-        positions=positions,
-        trajectories=trajectories,
-        time_values=times,
-        time_columns=time_columns,
-        sensor_series=sensor_series,
-        sensor_coords=sensor_coords,
-        sensor_mapping=sensor_mapping,
-        inlet_xyz=inlet_xyz,
-        outlet_xyz=outlet_xyz,
-        flow_sccm=float(flow_sccm),
+    trajectories = []
+    inlet_ids = []
+    outlet_ids = []
+    sccm_values = []
+    time_values_ref = None
+    sensor_names_ref = None
+    coords_map = _load_inlet_outlet_coords(inlet_outlet_coords_csv)
+    for path in files:
+        inlet_id, outlet_id, sccm = _parse_metadata_from_name(os.path.basename(path))
+        if inlet_id not in coords_map or outlet_id not in coords_map:
+            raise ValueError(
+                "Inlet or outlet id not found in inlet_outlet_coords.csv. "
+                f"Got inlet={inlet_id}, outlet={outlet_id} from {path}."
+            )
+        time_values, series, sensor_names = _load_surface_averages(path)
+        if time_values_ref is None:
+            time_values_ref = time_values
+            sensor_names_ref = sensor_names
+        else:
+            if len(time_values) != len(time_values_ref):
+                raise ValueError(
+                    "All surface averages files must share the same time length. "
+                    f"{path} has {len(time_values)} vs {len(time_values_ref)}."
+                )
+            if sensor_names != sensor_names_ref:
+                raise ValueError(
+                    "All surface averages files must share the same sensor columns. "
+                    f"{path} has {sensor_names}."
+                )
+        trajectories.append(series)
+        inlet_ids.append(inlet_id)
+        outlet_ids.append(outlet_id)
+        sccm_values.append(sccm)
+
+    traj_arr = np.stack(trajectories, axis=0).astype(np.float32)
+    inlet_ids_arr = np.asarray(inlet_ids, dtype=np.int64)
+    outlet_ids_arr = np.asarray(outlet_ids, dtype=np.int64)
+    sccm_arr = np.asarray(sccm_values, dtype=np.float32)
+
+    inlet_xyz = np.stack([coords_map[i] for i in inlet_ids_arr], axis=0)
+    outlet_xyz = np.stack([coords_map[i] for i in outlet_ids_arr], axis=0)
+    global_cond = np.concatenate([inlet_xyz, outlet_xyz, sccm_arr[:, None]], axis=1).astype(np.float32)
+
+    return TrajectoryBatch(
+        trajectories=traj_arr,
+        time_values=time_values_ref,
+        sensor_names=sensor_names_ref,
+        global_cond=global_cond,
+        inlet_ids=inlet_ids_arr,
+        outlet_ids=outlet_ids_arr,
+        sccm_values=sccm_arr,
     )
+
+
+def normalize_trajectories(trajectories: np.ndarray, eps: float = 1e-6) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+    mean = trajectories.mean(axis=(0, 1), keepdims=True)
+    std = trajectories.std(axis=(0, 1), keepdims=True)
+    std = np.maximum(std, eps)
+    return (trajectories - mean) / std, mean.astype(np.float32), std.astype(np.float32)
+
+
+class HistoryWindowDataset(Dataset):
+    def __init__(self, trajectories: torch.Tensor, global_cond: torch.Tensor, history_k: int):
+        if trajectories.ndim != 3:
+            raise ValueError("trajectories must have shape [num_traj, time, num_nodes].")
+        self.trajectories = trajectories
+        self.global_cond = global_cond
+        self.history_k = int(history_k)
+        if self.history_k < 1:
+            raise ValueError("history_k must be >= 1.")
+        self.num_traj, self.num_steps, _ = trajectories.shape
+        if self.num_steps <= self.history_k:
+            raise ValueError("Not enough timesteps to build history windows.")
+        self.steps_per_traj = self.num_steps - self.history_k
+
+    def __len__(self) -> int:
+        return self.num_traj * self.steps_per_traj
+
+    def __getitem__(self, idx: int):
+        traj_idx = idx // self.steps_per_traj
+        step_idx = idx % self.steps_per_traj
+        t = step_idx + self.history_k
+        history = self.trajectories[traj_idx, t - self.history_k : t]
+        target = self.trajectories[traj_idx, t]
+        cond = self.global_cond[traj_idx]
+        return history.unsqueeze(-1), target.unsqueeze(-1), cond

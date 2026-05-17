@@ -4,87 +4,94 @@ import numpy as np
 import pandas as pd
 import torch
 
-from .data_utils import build_sensor_point_mapping, ensure_columns, prepare_data
-from .features import build_global_condition, make_condition_matrix
-from .model import ConditionalFlowMatcher, sample_trajectories
+from .data_utils import build_global_cond_from_filename, load_trajectory_tensor
+from .features import default_sensor_positions_path, load_sensor_positions
+from .model import AutoregressiveFlowMatcher, euler_sample
+
+
+def _load_history_from_surface_csv(path: str, history_k: int) -> tuple[np.ndarray, np.ndarray]:
+    df = pd.read_csv(path)
+    if df.shape[1] < 2:
+        raise ValueError(f"Surface averages file {path} must include time and sensor columns.")
+    time_values = df.iloc[:, 0].to_numpy(dtype=np.float32)
+    series = df.iloc[:history_k, 1:].to_numpy(dtype=np.float32)
+    if series.shape[0] < history_k:
+        raise ValueError("Not enough timesteps in the init surface averages file.")
+    return series, time_values
 
 
 def generate(args) -> None:
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    constraint_mode = str(args.constraint_mode).lower()
     ckpt = torch.load(args.checkpoint, map_location=device)
 
-    model = ConditionalFlowMatcher(
-        traj_dim=int(ckpt["traj_dim"]),
-        cond_dim=int(ckpt["cond_dim"]),
+    if args.sensor_coords_csv:
+        sensor_positions = load_sensor_positions(args.sensor_coords_csv)
+    else:
+        sensor_positions = load_sensor_positions(default_sensor_positions_path(args.data_dir))
+
+    model = AutoregressiveFlowMatcher(
+        sensor_positions=torch.from_numpy(sensor_positions).to(device),
+        global_cond_dim=int(ckpt["global_cond_mean"].shape[-1]),
+        history_k=int(ckpt["history_k"]),
         hidden_dim=int(ckpt["hidden_dim"]),
+        num_layers=int(ckpt["num_layers"]),
+        num_heads=int(ckpt["num_heads"]),
     ).to(device)
     model.load_state_dict(ckpt["model_state_dict"])
     model.eval()
 
-    prepared = prepare_data(
-        traj_csv=args.traj_csv,
-        sensor_csv=args.sensor_csv,
-        sensor_coords_csv=args.sensor_coords_csv,
-        inlet_outlet_coords_csv=args.inlet_outlet_coords_csv,
-        inlet_id=args.inlet_id,
-        outlet_id=args.outlet_id,
-        flow_sccm=args.flow_sccm,
-        sensor_map_k=args.sensor_map_k,
-    )
-
-    if args.positions_csv:
-        pos_df = pd.read_csv(args.positions_csv)
-        ensure_columns(pos_df, ["x_m", "y_m", "z_m"], args.positions_csv)
-        positions = pos_df[["x_m", "y_m", "z_m"]].to_numpy(dtype=np.float32)
+    if args.init_surface_csv:
+        history, time_values = _load_history_from_surface_csv(args.init_surface_csv, int(ckpt["history_k"]))
+        global_cond = build_global_cond_from_filename(args.init_surface_csv, args.inlet_outlet_coords_csv)
     else:
-        positions = prepared.positions
-
-    pos_mean = np.asarray(ckpt["pos_mean"], dtype=np.float32)
-    pos_std = np.asarray(ckpt["pos_std"], dtype=np.float32)
-    pos_norm = (positions - pos_mean) / pos_std
-
-    cond_matrix = make_condition_matrix(pos_norm, build_global_condition(prepared))
-    cond_tensor = torch.from_numpy(cond_matrix).to(device)
-
-    sensor_mapping = build_sensor_point_mapping(
-        positions=positions,
-        sensor_coords=prepared.sensor_coords,
-        k=args.sensor_map_k,
-    )
+        batch = load_trajectory_tensor(
+            args.data_dir,
+            inlet_outlet_coords_csv=args.inlet_outlet_coords_csv,
+            max_files=1,
+        )
+        history = batch.trajectories[0, : int(ckpt["history_k"])]
+        time_values = batch.time_values
+        global_cond = batch.global_cond[0]
 
     traj_mean = np.asarray(ckpt["traj_mean"], dtype=np.float32)
     traj_std = np.asarray(ckpt["traj_std"], dtype=np.float32)
-    sensor_targets_norm = ((prepared.sensor_series.T.astype(np.float32) - traj_mean) / traj_std).astype(np.float32)
+    traj_mean_flat = traj_mean.squeeze(0).squeeze(0)
+    traj_std_flat = traj_std.squeeze(0).squeeze(0)
 
-    mode_for_sampling = constraint_mode
-    if positions.shape[0] < prepared.sensor_coords.shape[0] and constraint_mode in {"hard", "hybrid"}:
-        print(
-            "Warning: fewer generated positions than sensors; disabling hard projection for this run. "
-            "Use full-field generation to apply hard/hybrid sensor projection."
-        )
-        mode_for_sampling = "none"
+    history_norm = (history - traj_mean_flat) / traj_std_flat
+    history_t = torch.from_numpy(history_norm).unsqueeze(0).unsqueeze(-1).to(device)
 
-    x_norm = sample_trajectories(
-        model=model,
-        cond=cond_tensor,
-        traj_dim=int(ckpt["traj_dim"]),
-        num_steps=args.num_steps,
-        device=device,
-        constraint_mode=mode_for_sampling,
-        sensor_targets=torch.from_numpy(sensor_targets_norm).to(device),
-        sensor_indices=torch.from_numpy(sensor_mapping.indices).to(device),
-        sensor_weights=torch.from_numpy(sensor_mapping.weights).to(device),
-        projection_alpha=args.projection_alpha,
-        projection_every=args.projection_every,
-    ).cpu().numpy()
+    cond_mean = np.asarray(ckpt["global_cond_mean"], dtype=np.float32).squeeze(0)
+    cond_std = np.asarray(ckpt["global_cond_std"], dtype=np.float32).squeeze(0)
+    global_cond_norm = (global_cond - cond_mean) / cond_std
+    global_cond_t = torch.from_numpy(global_cond_norm.astype(np.float32)).unsqueeze(0).to(device)
 
-    generated = x_norm * traj_std + traj_mean
+    total_steps = int(args.trajectory_length)
+    history_k = int(ckpt["history_k"])
+    num_generate = max(0, total_steps - history_k)
 
-    out_df = pd.DataFrame(positions, columns=["x_m", "y_m", "z_m"])
-    for i, c in enumerate(ckpt["time_columns"]):
-        out_df[c] = generated[:, i]
+    generated = [history]
+    history_window = history_t
+    for _ in range(num_generate):
+        next_step_norm = euler_sample(model, history_window, global_cond_t, num_steps=args.num_steps)
+        next_step = (next_step_norm.squeeze(0).squeeze(-1).cpu().numpy() * traj_std_flat) + traj_mean_flat
+        generated.append(next_step[None, :])
+        next_step_t = torch.from_numpy((next_step - traj_mean_flat) / traj_std_flat)
+        next_step_t = next_step_t.unsqueeze(0).unsqueeze(0).unsqueeze(-1).to(device)
+        history_window = torch.cat([history_window[:, 1:], next_step_t], dim=1)
+
+    generated_arr = np.concatenate(generated, axis=0)
+
+    sensor_names = ckpt.get("sensor_names")
+    if sensor_names is None:
+        sensor_names = [f"Concentration_{i+1}" for i in range(generated_arr.shape[1])]
+
+    if time_values is None or len(time_values) != generated_arr.shape[0]:
+        time_values = np.arange(generated_arr.shape[0], dtype=np.float32)
+
+    out_df = pd.DataFrame(generated_arr, columns=sensor_names)
+    out_df.insert(0, "Time", time_values[: generated_arr.shape[0]])
 
     os.makedirs(os.path.dirname(args.output_csv) or ".", exist_ok=True)
     out_df.to_csv(args.output_csv, index=False)
-    print(f"Generated trajectories written to {args.output_csv}")
+    print(f"Generated trajectory written to {args.output_csv}")
